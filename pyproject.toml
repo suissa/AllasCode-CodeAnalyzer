@@ -1,0 +1,15 @@
+[project]
+name = "allascode-codeanalyzer"
+version = "0.1.0"
+description = "Deterministic static metrics for Zig 0.16 source code"
+requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "AllasCode"}]
+
+[project.scripts]
+allascode-codeanalyzer = "code_analyzer.cli:main"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
