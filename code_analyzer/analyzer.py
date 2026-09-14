@@ -20,6 +20,24 @@ SWITCH_RE = re.compile(r"\bswitch\s*\(")
 SWITCH_PRONG_RE = re.compile(r"=>")
 ELSE_PRONG_RE = re.compile(r"\belse\s*=>")
 
+# Primitive representation details should not escape semantic boundaries. `bool`,
+# `void`, `noreturn`, `type` and error mechanics are intentionally omitted: they
+# describe control/semantic shape rather than a storage width chosen by Zig.
+PRIMITIVE_TYPE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"u(?:8|16|32|64|128|256|size)|"
+    r"i(?:8|16|32|64|128|256|size)|"
+    r"f(?:16|32|64|80|128)|"
+    r"c_(?:char|short|ushort|int|uint|long|ulong|longlong|ulonglong)|"
+    r"comptime_(?:int|float)"
+    r")(?![A-Za-z0-9_])"
+)
+LOW_LEVEL_INTRINSIC_RE = re.compile(
+    r"@(ptrCast|alignCast|bitCast|intCast|floatCast|truncate|constCast|volatileCast|"
+    r"addrSpaceCast|intFromPtr|ptrFromInt)\b"
+)
+RAW_POINTER_TYPE_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\*|\[\*c?\]|\[\*:.*?\])")
+
 
 @dataclass(frozen=True)
 class FunctionMetrics:
@@ -43,6 +61,8 @@ class FunctionMetrics:
     allocation_indicators: int
     comptime_operations: int
     cast_operations: int
+    primitive_type_exposures: int
+    low_level_intrinsics: int
     markers: dict[str, int]
 
 
@@ -134,6 +154,20 @@ def _find_functions(code_lines: list[str]) -> list[tuple[str, bool, int, int]]:
     return functions
 
 
+def _function_signature(code_lines: list[str], start: int) -> str:
+    parts: list[str] = []
+    depth = 0
+    seen_open = False
+    for line in code_lines[start:]:
+        masked = _mask_strings(line)
+        parts.append(masked.strip())
+        depth += masked.count("(") - masked.count(")")
+        seen_open = seen_open or "(" in masked
+        if seen_open and depth <= 0:
+            break
+    return " ".join(parts)
+
+
 def _decision_metrics(lines: list[str]) -> tuple[int, int, int, int]:
     cyclomatic = 1
     cognitive = 0
@@ -222,6 +256,11 @@ def analyze_source(source: str, *, path: str = "<memory>") -> dict:
         comment_lines = sum(1 for c in f_comments if c is not None)
         doc_lines = sum(1 for d in f_docs if d)
         text = "\n".join(f_code)
+        signature = _function_signature(code_lines, start)
+        primitive_exposures = len(PRIMITIVE_TYPE_RE.findall(signature)) if public else 0
+        raw_pointer_exposures = len(RAW_POINTER_TYPE_RE.findall(signature)) if public else 0
+        low_level_intrinsics = len(LOW_LEVEL_INTRINSIC_RE.findall(text))
+
         metrics = FunctionMetrics(
             name=name,
             public=public,
@@ -243,6 +282,8 @@ def analyze_source(source: str, *, path: str = "<memory>") -> dict:
             allocation_indicators=len(ALLOCATION_RE.findall(text)),
             comptime_operations=len(COMPTIME_RE.findall(text)),
             cast_operations=len(CAST_RE.findall(text)),
+            primitive_type_exposures=primitive_exposures + raw_pointer_exposures,
+            low_level_intrinsics=low_level_intrinsics,
             markers=_count_markers(f_comments),
         )
         functions.append(metrics)
@@ -255,10 +296,25 @@ def analyze_source(source: str, *, path: str = "<memory>") -> dict:
             findings.append(Finding("medium", "complexity.nesting", f"Function {name} reaches decision nesting depth {nesting} (> 4).", start + 1, name))
         if metrics.loc > 80:
             findings.append(Finding("medium", "size.long_function", f"Function {name} spans {metrics.loc} lines (> 80).", start + 1, name))
-        if public and not documented:
-            findings.append(Finding("medium", "docs.public_api", f"Public function {name} has no documentation comment.", start + 1, name))
-        if (cyclomatic > 7 or cognitive > 10) and comment_lines == 0:
-            findings.append(Finding("medium", "docs.complexity_gap", f"Complex function {name} has no explanatory comments.", start + 1, name))
+
+        # Comments are evidence, not a quality requirement. Reproducible semantic
+        # intent belongs in SKILL/contract artifacts and in semantic identifiers.
+        if metrics.primitive_type_exposures:
+            findings.append(Finding(
+                "high",
+                "portability.primitive_boundary",
+                f"Public function {name} exposes {metrics.primitive_type_exposures} low-level primitive representation(s); use semantic domain types at the boundary.",
+                start + 1,
+                name,
+            ))
+        if public and low_level_intrinsics:
+            findings.append(Finding(
+                "medium",
+                "portability.low_level_public",
+                f"Public function {name} contains {low_level_intrinsics} low-level intrinsic operation(s); encapsulate them behind a semantic function.",
+                start + 1,
+                name,
+            ))
 
     total_lines = len(source.splitlines())
     source_lines = sum(1 for line in code_lines if line.strip())
@@ -267,13 +323,15 @@ def analyze_source(source: str, *, path: str = "<memory>") -> dict:
     public_functions = [f for f in functions if f.public]
     documented_public = [f for f in public_functions if f.documented]
     marker_counts = _count_markers(comments)
+    primitive_exposures = sum(f.primitive_type_exposures for f in functions)
+    low_level_public = sum(f.low_level_intrinsics for f in public_functions)
 
     for marker, count in marker_counts.items():
         if count:
             findings.append(Finding("info", f"comment.{marker.lower()}", f"Found {count} {marker} marker(s)."))
 
     return {
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "language": "zig",
         "language_target": "0.16",
         "path": path,
@@ -287,6 +345,8 @@ def analyze_source(source: str, *, path: str = "<memory>") -> dict:
             "public_functions": len(public_functions),
             "documented_public_functions": len(documented_public),
             "public_api_documentation_coverage": (len(documented_public) / len(public_functions)) if public_functions else 1.0,
+            "primitive_boundary_exposures": primitive_exposures,
+            "low_level_public_intrinsics": low_level_public,
             "markers": marker_counts,
         },
         "functions": [asdict(f) for f in functions],
@@ -307,8 +367,10 @@ def analyze_path(path: str | Path) -> dict:
     function_count = sum(item["summary"]["functions"] for item in analyses)
     public_count = sum(item["summary"]["public_functions"] for item in analyses)
     documented_public = sum(item["summary"]["documented_public_functions"] for item in analyses)
+    primitive_exposures = sum(item["summary"]["primitive_boundary_exposures"] for item in analyses)
+    low_level_public = sum(item["summary"]["low_level_public_intrinsics"] for item in analyses)
     return {
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "language": "zig",
         "language_target": "0.16",
         "root": str(root),
@@ -318,6 +380,8 @@ def analyze_path(path: str | Path) -> dict:
             "public_functions": public_count,
             "documented_public_functions": documented_public,
             "public_api_documentation_coverage": (documented_public / public_count) if public_count else 1.0,
+            "primitive_boundary_exposures": primitive_exposures,
+            "low_level_public_intrinsics": low_level_public,
             "findings": len(findings),
         },
         "files": analyses,
