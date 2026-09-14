@@ -28,7 +28,7 @@ fn internal(flag: bool) void {
 
 
 class AnalyzerTests(unittest.TestCase):
-    def test_detects_functions_and_docs(self):
+    def test_detects_functions_and_docs_as_descriptive_evidence(self):
         report = analyze_source(SAMPLE, path="sample.zig")
         self.assertEqual(report["summary"]["functions"], 2)
         self.assertEqual(report["summary"]["public_functions"], 1)
@@ -47,14 +47,29 @@ class AnalyzerTests(unittest.TestCase):
         report = analyze_source(SAMPLE)
         self.assertEqual(report["summary"]["markers"]["TODO"], 1)
 
-    def test_undocumented_public_api_finding(self):
+    def test_comments_are_not_a_quality_gate(self):
         report = analyze_source("pub fn exposed() void {}\n")
         rules = {item["rule"] for item in report["findings"]}
-        self.assertIn("docs.public_api", rules)
+        self.assertNotIn("docs.public_api", rules)
+        self.assertNotIn("docs.complexity_gap", rules)
 
     def test_comment_density_is_descriptive(self):
         report = analyze_source("// hello\nconst x = 1;\n")
         self.assertAlmostEqual(report["summary"]["comment_density"], 0.5)
+
+    def test_public_primitive_types_are_portability_findings(self):
+        report = analyze_source("pub fn load(id: u64, amount: i32) u32 { return @intCast(id + @as(u64, @intCast(amount))); }\n")
+        rules = {item["rule"] for item in report["findings"]}
+        self.assertIn("portability.primitive_boundary", rules)
+        self.assertIn("portability.low_level_public", rules)
+        self.assertGreaterEqual(report["summary"]["primitive_boundary_exposures"], 3)
+
+    def test_semantic_types_do_not_leak_storage_width(self):
+        source = "const UserId = struct { value: u64 };\nconst Amount = struct { value: i64 };\npub fn debit(id: UserId, amount: Amount) void { _ = id; _ = amount; }\n"
+        report = analyze_source(source)
+        rules = {item["rule"] for item in report["findings"]}
+        self.assertNotIn("portability.primitive_boundary", rules)
+        self.assertEqual(report["summary"]["primitive_boundary_exposures"], 0)
 
 
 if __name__ == "__main__":
